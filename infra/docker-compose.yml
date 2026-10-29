@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: platform_lab
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d platform_lab"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
