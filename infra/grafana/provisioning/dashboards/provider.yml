@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: System diagnostics lab
+    orgId: 1
+    folder: System diagnostics lab
+    type: file
+    disableDeletion: true
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
