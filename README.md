@@ -97,24 +97,24 @@ Do not run another API on port `3001` while this script is running. Generated re
 
 The k6 JSON files contain request rate, latency percentiles, and failed-request rate. The adjacent `.metrics` files are raw Prometheus exposition snapshots. Compare:
 
-- `http_req_duration.values.p95` and `http_req_failed.values.rate` in each k6 JSON summary.
+- `http_reqs.rate`, `http_req_duration["p(95)"]`, and `http_req_failed.value` in each k6 JSON summary.
 - `api_database_item_list_queries_total` and `api_database_item_list_query_duration_seconds` in the matching metrics snapshot.
-- `api_cache_operations_total{result="hit"}` and `{result="miss"}` in the cache-enabled snapshot.
+- `api_cache_operations_total{result="hit"}`, `{result="miss"}`, and `{result="bypass"}` in the matching metrics snapshot.
 
-Each run makes one warm-up request before k6 starts, so subtract that one request from the database query counter if reporting only load-test queries. Compare the median across repetitions, not just one fastest run. Check both the k6 error rate and the endpoint's 5xx ratio; faster responses are not an improvement if they come with more failures.
+Each run makes one warm-up request before k6 starts, so subtract that one request from the database query counter if reporting only load-test queries. Cache-operation counters include the warm-up request. Compare the median across repetitions, not just one fastest run. Check both the k6 error rate and the endpoint's 5xx ratio; faster responses are not an improvement if they come with more failures.
 
 ## Interpreting the results
 
 The hypothesis is that, for repeated reads of the same list, enabling the cache will reduce PostgreSQL list queries. Whether it also improves end-to-end p95 latency depends on the machine, data size, serialization cost, Redis overhead, and response size.
 
-Record the actual environment and results. A useful report table is:
+Measured on a local Mac with two repetitions per mode, a 10,000-row dataset, and 10 VUs for 60 seconds per run. Values below are medians across the two repetitions:
 
-| Mode | Dataset | VUs / duration | Request rate | p95 latency | Failed requests | DB list queries during load |
-|---|---:|---|---:|---:|---:|---:|
-| Cache bypassed | 10,000 rows | 10 / 60s | _measure_ | _measure_ | _measure_ | _measure_ |
-| Cache enabled | 10,000 rows | 10 / 60s | _measure_ | _measure_ | _measure_ | _measure_ |
+| Mode | Environment / dataset | VUs / duration | Request rate | p95 latency | Failed-request rate | DB list queries during load | Cache hits / misses (bypasses) |
+|---|---|---|---:|---:|---:|---:|---:|
+| Cache bypassed | Local Mac; 10,000 rows | 10 / 60s | 47.68 req/s | 296.35 ms | 0.00% | 2,869 | 0 / 0 (2,870 bypasses) |
+| Cache enabled | Local Mac; 10,000 rows | 10 / 60s | 176.04 req/s | 65.01 ms | 0.00% | 0 | 10,571 / 1 (0 bypasses) |
 
-Don't fill in estimated numbers. Repeat each run if results are noisy, keep the setup unchanged, and state that a local benchmark is not a production capacity guarantee.
+Database query counts exclude the warm-up request; cache hit/miss/bypass counts include it. The cache-enabled miss is the pre-load warm-up. These local measurements are not a production capacity guarantee.
 
 The dashboard shows request rate, p95 latency, cache mode and hit ratio, PostgreSQL list-query rate and p95, and 5xx ratio. Use Jaeger to inspect representative traces and see time spent in the request and Redis operations. The metrics let you observe the system; the load test creates the workload; traces help explain where time went.
 
