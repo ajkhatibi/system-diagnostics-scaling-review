@@ -99,7 +99,7 @@ The k6 JSON files contain request rate, latency percentiles, and failed-request 
 
 - `http_reqs.rate`, `http_req_duration["p(95)"]`, and `http_req_failed.value` in each k6 JSON summary.
 - `api_database_item_list_queries_total` and `api_database_item_list_query_duration_seconds` in the matching metrics snapshot.
-- `api_cache_operations_total{result="hit"}`, `{result="miss"}`, and `{result="bypass"}` in the matching metrics snapshot.
+- `api_cache_operations_total{result="hit"}`, `{result="miss"}`, `{result="bypass"}`, and `{result="fallback"}` (Redis unavailable; expected to be 0 in a healthy run) in the matching metrics snapshot.
 
 Each run makes one warm-up request before k6 starts, so subtract that one request from the database query counter if reporting only load-test queries. Cache-operation counters include the warm-up request. Compare the median across repetitions, not just one fastest run. Check both the k6 error rate and the endpoint's 5xx ratio; faster responses are not an improvement if they come with more failures.
 
@@ -120,8 +120,9 @@ The dashboard shows request rate, p95 latency, cache mode and hit ratio, Postgre
 
 ## Failure behavior and limitations
 
-- With cache bypassed, readiness checks require PostgreSQL but do not require Redis. With cache enabled, readiness checks both dependencies.
-- With cache enabled, Redis errors currently fail the request rather than silently falling back to PostgreSQL. That makes the failure visible in this lab; deciding whether to fail open, and how to keep stale data bounded, is a separate reliability trade-off.
+- With cache bypassed, readiness checks require PostgreSQL but do not require Redis. With cache enabled, readiness also probes Redis, but a Redis failure only reports `{"status":"degraded","cache":"unavailable"}` (HTTP 200) because the API can still serve from PostgreSQL. A PostgreSQL failure returns 503.
+- With cache enabled, if Redis errors or does not respond within 250 ms, `GET /items` falls back to PostgreSQL and `POST /items` still succeeds. Redis is then skipped for 5 seconds before being retried, so an outage costs one timeout per interval rather than one per request. Failures are visible as `api_cache_operations_total{result="fallback"}`, `api_redis_errors_total{command=...}`, and warning logs. This makes cache-enabled runs look like cache-bypassed runs for the duration of an outage.
+- If the cache invalidation after `POST /items` fails, the process refuses to read the cache until it has successfully deleted the stale list, so it does not serve stale data after Redis recovers. This is tracked in memory only: stale data can still be served if the API restarts during an outage, or if multiple API instances are running. A TTL on the cached list would bound this.
 - The entire item list is cached under one key, with no TTL or pagination. This is intentionally simple and can become memory-, serialization-, and response-size-heavy.
 - The API runs on the host while its dependencies run in Compose. Prometheus reaches it through `host.docker.internal`; this local setup is not a production deployment.
 - The demo Grafana password is `admin`; do not reuse these settings outside a local environment.

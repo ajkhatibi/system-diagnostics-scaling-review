@@ -9,9 +9,14 @@ const database = new Pool({
     process.env.DATABASE_URL ??
     'postgres://lab:lab@localhost:5432/platform_lab',
 });
-const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379');
+const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
+  enableOfflineQueue: false,
+});
 const cacheEnabled = process.env.CACHE_ENABLED !== 'false';
 const app = createApp({ database, redis, cacheEnabled });
+redis.on('error', (error) => {
+  app.log.warn({ err: error }, 'Redis connection error');
+});
 
 async function start(): Promise<void> {
   try {

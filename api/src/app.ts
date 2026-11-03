@@ -1,5 +1,5 @@
 import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
-import Fastify from 'fastify';
+import Fastify, { type FastifyBaseLogger } from 'fastify';
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
 
 interface Item {
@@ -23,7 +23,13 @@ interface AppDependencies {
   database: DatabaseClient;
   redis: RedisClient;
   cacheEnabled: boolean;
+  /** Maximum time to wait for a Redis command before treating Redis as down. */
+  redisTimeoutMs?: number;
+  /** How long to skip Redis after a failure before trying it again. */
+  redisRetryIntervalMs?: number;
 }
+
+type RedisResult<T> = { ok: true; value: T } | { ok: false };
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -62,7 +68,24 @@ async function withRedisSpan<T>(
   );
 }
 
-export function createApp({ database, redis, cacheEnabled }: AppDependencies) {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Redis command timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+export function createApp({
+  database,
+  redis,
+  cacheEnabled,
+  redisTimeoutMs = 250,
+  redisRetryIntervalMs = 5000,
+}: AppDependencies) {
   const app = Fastify({ logger: true });
   const registry = new Registry();
   collectDefaultMetrics({ register: registry });
@@ -97,6 +120,12 @@ export function createApp({ database, redis, cacheEnabled }: AppDependencies) {
     help: 'Successful item cache invalidations.',
     registers: [registry],
   });
+  const redisErrors = new Counter({
+    name: 'api_redis_errors_total',
+    help: 'Redis commands that failed or timed out, causing a PostgreSQL fallback.',
+    labelNames: ['command'],
+    registers: [registry],
+  });
   const databaseItemListQueries = new Counter({
     name: 'api_database_item_list_queries_total',
     help: 'Number of item-list queries issued to PostgreSQL.',
@@ -107,6 +136,43 @@ export function createApp({ database, redis, cacheEnabled }: AppDependencies) {
     help: 'Duration of item-list queries to PostgreSQL in seconds.',
     registers: [registry],
   });
+
+  let redisUnavailableUntil = 0;
+  let invalidationsRequested = 0;
+  let invalidationsCompleted = 0;
+
+  async function tryRedis<T>(
+    command: string,
+    log: FastifyBaseLogger,
+    operation: () => Promise<T>,
+    { probe = false }: { probe?: boolean } = {},
+  ): Promise<RedisResult<T>> {
+    if (!probe && Date.now() < redisUnavailableUntil) {
+      return { ok: false };
+    }
+    try {
+      const value = await withRedisSpan(command, () =>
+        withTimeout(operation(), redisTimeoutMs),
+      );
+      redisUnavailableUntil = 0;
+      return { ok: true, value };
+    } catch (error) {
+      redisUnavailableUntil = Date.now() + redisRetryIntervalMs;
+      redisErrors.inc({ command });
+      log.warn({ err: error, command }, 'Redis unavailable; falling back to PostgreSQL');
+      return { ok: false };
+    }
+  }
+
+  async function invalidateItemCache(log: FastifyBaseLogger): Promise<boolean> {
+    const requested = invalidationsRequested;
+    const result = await tryRedis('DEL', log, () => redis.del('items'));
+    if (result.ok) {
+      invalidationsCompleted = Math.max(invalidationsCompleted, requested);
+      cacheInvalidations.inc();
+    }
+    return result.ok;
+  }
 
   app.addHook('onRequest', async (request) => {
     request.startTime = process.hrtime.bigint();
@@ -128,11 +194,15 @@ export function createApp({ database, redis, cacheEnabled }: AppDependencies) {
 
   app.get('/health/ready', async (request, reply) => {
     try {
-      const checks: Promise<unknown>[] = [database.query('SELECT 1')];
-      if (cacheEnabled) {
-        checks.push(withRedisSpan('PING', () => redis.ping()));
+      const [, ping] = await Promise.all([
+        database.query('SELECT 1'),
+        cacheEnabled
+          ? tryRedis('PING', request.log, () => redis.ping(), { probe: true })
+          : undefined,
+      ]);
+      if (ping && !ping.ok) {
+        return { status: 'degraded', cache: 'unavailable' };
       }
-      await Promise.all(checks);
       return { status: 'ok' };
     } catch (error) {
       request.log.warn({ err: error }, 'Readiness check failed');
@@ -160,21 +230,31 @@ export function createApp({ database, redis, cacheEnabled }: AppDependencies) {
         [request.body.name],
       );
       if (cacheEnabled) {
-        await withRedisSpan('DEL', () => redis.del('items'));
-        cacheInvalidations.inc();
+        invalidationsRequested += 1;
+        await invalidateItemCache(request.log);
       }
       return reply.code(201).send(result.rows[0]);
     },
   );
 
-  app.get('/items', async () => {
+  app.get('/items', async (request) => {
+    let cacheAvailable = false;
     if (cacheEnabled) {
-      const cachedItems = await withRedisSpan('GET', () => redis.get('items'));
-      if (cachedItems !== null) {
-        cacheOperations.inc({ result: 'hit' });
-        return JSON.parse(cachedItems) as Item[];
+      cacheAvailable =
+        invalidationsCompleted >= invalidationsRequested ||
+        (await invalidateItemCache(request.log));
+
+      if (cacheAvailable) {
+        const cached = await tryRedis('GET', request.log, () => redis.get('items'));
+        if (cached.ok && cached.value !== null) {
+          cacheOperations.inc({ result: 'hit' });
+          return JSON.parse(cached.value) as Item[];
+        }
+        cacheAvailable = cached.ok;
+        cacheOperations.inc({ result: cached.ok ? 'miss' : 'fallback' });
+      } else {
+        cacheOperations.inc({ result: 'fallback' });
       }
-      cacheOperations.inc({ result: 'miss' });
     } else {
       cacheOperations.inc({ result: 'bypass' });
     }
@@ -193,8 +273,8 @@ export function createApp({ database, redis, cacheEnabled }: AppDependencies) {
       );
     }
 
-    if (cacheEnabled) {
-      await withRedisSpan('SET', () =>
+    if (cacheAvailable) {
+      await tryRedis('SET', request.log, () =>
         redis.set('items', JSON.stringify(rows)),
       );
     }
