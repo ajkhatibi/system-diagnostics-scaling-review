@@ -9,7 +9,8 @@ The goal is not to claim that caching is always faster. It is to form a hypothes
 - A PostgreSQL-backed API with request validation and Redis cache-aside reads.
 - A controlled cache-off/cache-on comparison against the same seeded dataset.
 - Prometheus metrics for request latency, errors, cache outcomes, and database list-query cost.
-- A provisioned Grafana dashboard for comparing the service during a run.
+- A provisioned Grafana dashboard for comparing the service during a run, including saturation panels (event-loop lag, CPU, memory).
+- A saturation analysis that identifies the first bottleneck under load and what would change at 10x.
 - OpenTelemetry traces exported to Jaeger, including explicit Redis command spans.
 - Fastify route tests and a TypeScript typecheck.
 
@@ -117,6 +118,66 @@ Measured on a local Mac with two repetitions per mode, a 10,000-row dataset, and
 Database query counts exclude the warm-up request; cache hit/miss/bypass counts include it. The cache-enabled miss is the pre-load warm-up. These local measurements are not a production capacity guarantee.
 
 The dashboard shows request rate, p95 latency, cache mode and hit ratio, PostgreSQL list-query rate and p95, 5xx ratio, and API saturation: Node.js event-loop lag (mean and p99), CPU usage in cores, and resident memory (RSS). Use Jaeger to inspect representative traces and see time spent in the request and Redis operations. The metrics let you observe the system; the load test creates the workload; traces help explain where time went.
+
+## Bottleneck
+
+To find which resource runs out first, the cache-enabled API was loaded with 10 VUs for 180 seconds on the same local Mac and 10,000-row dataset, with the cache already warm:
+
+```sh
+BASE_URL=http://localhost:3001 VUS=10 DURATION=180s k6 run benchmark/items.js
+```
+
+The saturation panels were watched during the run. The values below come from the same PromQL queries, evaluated in Prometheus over the run window.
+
+| Signal | Idle, before the run | During the run |
+|---|---:|---:|
+| Request rate (k6) | – | 176.38 req/s |
+| p95 latency (k6) | – | 66.93 ms |
+| Failed requests (k6) | – | 0.00% (0 of 31,759) |
+| API CPU, `rate(process_cpu_seconds_total[1m])` | 0.004 cores | 1.11 cores average (1.09–1.14 once the 1-minute window filled) |
+| Event-loop lag, mean | 11.27 ms | 14.64 ms average, 16.03 ms highest |
+| Event-loop lag, p99 | 17.40 ms | 24.13 ms average, 38.21 ms highest |
+| API resident memory (RSS) | 46.7 MB | 336.2 MB average (272.7–425.7 MB) |
+| Redis container CPU (`docker stats`) | 0.7% of one core | 7–11% of one core |
+| PostgreSQL item-list queries | – | 0 (every request was a cache hit) |
+
+Each `GET /items` response was 807,862 bytes; k6 received 26 GB in total (143 MB/s).
+
+**The first resource to saturate is CPU in the API's single Node.js process.**
+
+- API CPU rose to about 1.1 cores in the first minute and stayed flat while throughput held at about 176 req/s. Node.js runs request handling on one main JavaScript thread, so one process cannot apply much more than one core to requests; the small excess above 1.0 is work on Node's background threads.
+- Nothing else was near a limit. Redis used 7–11% of one core, PostgreSQL served no list queries, k6 used about 11% of one core, and the machine has 10 CPU cores.
+- Each request cost about 6.3 ms of CPU (1.11 cores ÷ 176.38 req/s), yet requests averaged 56.58 ms in k6. With 10 VUs sharing one busy thread, requests spend most of their time waiting their turn.
+- The likely source of that CPU is the cache-hit path in [api/src/app.ts](api/src/app.ts): it parses the cached ~808 KB JSON string into about 10,000 row objects, then Fastify serializes them back to JSON for the response. Both are synchronous work on the main thread for every request. This has not been profiled; a CPU profile (`node --cpu-prof`) would confirm how the 6.3 ms splits.
+
+How to read the other panels:
+
+- **Event-loop lag rose only a few milliseconds even though the thread was busy.** Lag measures how late a timer fires, so it reflects the longest single stretch of synchronous work, not overall utilization; each request's work is a few milliseconds long. The idle value is about 11 ms because prom-client samples with a 10 ms timer by default and the reading includes that interval. Compare against the idle value rather than zero.
+- **Memory is not the limit at this load.** RSS moved up and down between 272.7 and 425.7 MB rather than climbing, and fell to 113 MB within 30 seconds after the run. That pattern fits short-lived garbage from building and discarding the 808 KB list on every request. Garbage collection took about 4.1% of wall-clock time.
+- **The dashboard's p95 (about 49 ms) is lower than k6's (66.93 ms).** The server histogram has bucket boundaries at 25, 50, and 100 ms, so its p95 is interpolated: 97.0% of requests finished within 50 ms on the server. The gap is time outside the route handler, such as waiting for the busy event loop to pick up the request and transferring 808 KB to the client. Use the k6 figure as the user-facing latency.
+
+The cache-bypassed mode was not re-measured with these panels, so its bottleneck may differ.
+
+## 10x scaling
+
+The target is about 1,760 req/s, ten times the cache-enabled rate of 176.04 req/s in the comparison table. The projections below scale the measured per-request costs linearly; they have not been load-tested.
+
+**What breaks first: API CPU.** At about 6.3 ms of CPU per request, 1,760 req/s needs about 11 cores of request handling (10 × 1.11 cores). One Node.js process supplies about one core of request handling, so a single instance stays near 176 req/s; more load would be expected to add queueing (higher latency at the same throughput) rather than throughput. That is also more CPU than this 10-core Mac has, before counting k6 and Redis, so 10x cannot be demonstrated on this machine.
+
+**The next limits once CPU is scaled out:**
+
+- **Response bytes.** k6 received 143 MB/s at 176 req/s. Ten times that is about 1.4 GB/s (about 11 Gbit/s), almost all of it the same list repeated.
+- **Redis.** Every request reads the whole 808 KB value from one key. Redis used 7–11% of one core at 176 req/s; scaled linearly, that is about 70–110% of one core. Redis runs commands on a single thread, so one hot key on one Redis instance would be at or near its limit.
+- **PostgreSQL on cache misses.** While the cache is warm, PostgreSQL serves no list queries. But the cache-bypassed mode handled 47.68 req/s in the comparison table, and 1,760 req/s is about 37 times that. A Redis outage or a cache invalidation (every `POST /items`) would send that traffic to the database path, and every instance would reload the full list at once because concurrent misses are not coalesced.
+- **Memory.** Each instance peaked at 425.7 MB RSS at 176 req/s. Reaching 10x by adding instances multiplies total memory accordingly.
+
+**What would change, in order:**
+
+1. **Cut CPU per request first, because it is the measured bottleneck.** On cache hits, send the cached JSON string as-is instead of parsing and re-serializing it. Re-run this test and compare CPU per request.
+2. **Paginate `GET /items`** with a bounded page size (for example, keyset pagination on `id`) and cache pages. Smaller responses reduce CPU, garbage, Redis traffic, and network bytes together.
+3. **Run multiple API processes**, using the Node.js cluster module or several containers behind a load balancer. At today's cost that is about 10 processes, each needing a little over one core; steps 1 and 2 reduce the count.
+4. **Protect Redis and PostgreSQL.** Coalesce concurrent misses so one request reloads the list. Add a TTL. Consider a short-lived in-process copy of the hot list so instances don't each pull 808 KB from Redis per request. Replace the in-process invalidation tracking with shared, versioned cache keys so multiple instances cannot serve stale data (see below).
+5. **Measure 10x on separate machines,** with the load generator off the API host, using the same signals: k6 p95, API CPU, event-loop lag, RSS, and Redis CPU.
 
 ## Failure behavior and limitations
 
