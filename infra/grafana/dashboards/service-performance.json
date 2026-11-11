@@ -316,11 +316,16 @@
       "targets": [
         {
           "expr": "nodejs_eventloop_lag_mean_seconds",
-          "legendFormat": "mean lag",
+          "legendFormat": "mean",
           "refId": "A"
+        },
+        {
+          "expr": "nodejs_eventloop_lag_p99_seconds",
+          "legendFormat": "p99",
+          "refId": "B"
         }
       ],
-      "title": "Node event-loop lag (mean)",
+      "title": "Node.js event loop lag",
       "type": "timeseries"
     },
     {
@@ -329,9 +334,7 @@
         "uid": "prometheus"
       },
       "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit"
-        },
+        "defaults": {},
         "overrides": []
       },
       "gridPos": {
@@ -352,12 +355,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(process_cpu_seconds_total[1m]))",
-          "legendFormat": "CPU",
+          "expr": "rate(process_cpu_seconds_total[1m])",
+          "legendFormat": "CPU cores",
           "refId": "A"
         }
       ],
-      "title": "Process CPU",
+      "title": "API CPU usage",
       "type": "timeseries"
     },
     {
@@ -394,7 +397,7 @@
           "refId": "A"
         }
       ],
-      "title": "Process memory (RSS)",
+      "title": "API memory (resident)",
       "type": "timeseries"
     }
   ],

@@ -116,7 +116,7 @@ Measured on a local Mac with two repetitions per mode, a 10,000-row dataset, and
 
 Database query counts exclude the warm-up request; cache hit/miss/bypass counts include it. The cache-enabled miss is the pre-load warm-up. These local measurements are not a production capacity guarantee.
 
-The dashboard shows request rate, p95 latency, cache mode and hit ratio, PostgreSQL list-query rate and p95, 5xx ratio, and API process health: mean Node event-loop lag, CPU usage, and resident memory (RSS). Use Jaeger to inspect representative traces and see time spent in the request and Redis operations. The metrics let you observe the system; the load test creates the workload; traces help explain where time went.
+The dashboard shows request rate, p95 latency, cache mode and hit ratio, PostgreSQL list-query rate and p95, 5xx ratio, and API saturation: Node.js event-loop lag (mean and p99), CPU usage in cores, and resident memory (RSS). Use Jaeger to inspect representative traces and see time spent in the request and Redis operations. The metrics let you observe the system; the load test creates the workload; traces help explain where time went.
 
 ## Failure behavior and limitations
 
